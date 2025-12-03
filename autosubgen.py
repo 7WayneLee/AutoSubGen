@@ -46,7 +46,7 @@ class OpenAIBackend(LLMBackend):
 
     def check_health(self):
         try:
-            self.client.models.list() # 簡單驗證
+            self.client.models.list() 
         except Exception as e:
             raise ConnectionError(f"OpenAI 連線失敗: {e}")
 
@@ -68,10 +68,9 @@ class GeminiBackend(LLMBackend):
             raise ValueError("缺少 GEMINI_API_KEY")
         genai.configure(api_key=config.GEMINI_API_KEY)
         self.model_name = config.MODELS["gemini"]
-        # Gemini 的設定
         self.generation_config = {
             "temperature": 0.3,
-            "response_mime_type": "application/json" # 強制 JSON
+            "response_mime_type": "application/json"
         }
 
     def check_health(self):
@@ -106,7 +105,6 @@ class ClaudeBackend(LLMBackend):
             raise ConnectionError(f"Claude 連線失敗: {e}")
 
     def process_batch(self, system_prompt: str, user_content: str) -> str:
-        # Claude 沒有原生的 json_object 模式參數，但在 Prompt 中強調即可，或使用 prefill
         message = self.client.messages.create(
             model=self.model,
             max_tokens=4096,
@@ -122,13 +120,10 @@ class ClaudeBackend(LLMBackend):
 
 class AutoSubGen:
     def __init__(self, provider: str = "openai"):
-        """
-        初始化：設定計算設備並載入指定的 LLM Provider
-        """
+        """初始化：設定計算設備並載入指定的 LLM Provider"""
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info(f"正在使用計算設備: {self.device}")
         
-        # --- Factory Pattern: 根據選擇實例化不同的 Backend ---
         logger.info(f"正在初始化 LLM Provider: {provider.upper()}...")
         try:
             if provider == "openai":
@@ -140,7 +135,6 @@ class AutoSubGen:
             else:
                 raise ValueError("不支援的 Provider")
             
-            # 統一進行健康檢查
             self.llm.check_health()
             logger.info(f"✅ {provider.upper()} API 連線驗證成功！")
             
@@ -150,30 +144,18 @@ class AutoSubGen:
             sys.exit(1)
 
         self.whisper_model = None
-        self._stop_monitoring = False  # 控制監控執行緒的標誌
+        self._stop_monitoring = False
 
-    # (generate_output_paths, _load_whisper_model, transcribe_and_refine, translate_subtitles 
-    #  這些方法邏輯不變，除了調用 _process_text_with_gpt 時不需要改動)
-    
-    # 省略重複代碼，只列出與 LLM 互動相關的修改...
-    # --- 新增：系統資源監控方法 ---
+    # --- 系統資源監控 ---
     def _monitor_resources(self):
-        """後臺執行緒：每隔幾秒印出系統記憶體佔用"""
         while not self._stop_monitoring:
-            # 獲取記憶體資訊
             mem = psutil.virtual_memory()
             total_gb = mem.total / (1024 ** 3)
             used_gb = mem.used / (1024 ** 3)
             percent = mem.percent
-            
-            # 使用 \033 顏色代碼讓它顯眼一點 (青色)
-            # 格式：[System] RAM: 8.5GB / 32.0GB (26.5%)
             print(f"\033[96m[System Monitor] RAM Usage: {used_gb:.2f}GB / {total_gb:.2f}GB ({percent}%)\033[0m")
-            
-            # 每 3 秒更新一次
             time.sleep(3)
     
-    # 必須完整保留 generate_output_paths
     def generate_output_paths(self, video_path: str) -> dict:
         base_name = os.path.splitext(os.path.basename(video_path))[0]
         save_dir_config = config.OUTPUT_SETTINGS.get("save_dir", "")
@@ -189,7 +171,6 @@ class AutoSubGen:
             "merge": os.path.join(output_dir, f"{base_name}{config.OUTPUT_SETTINGS['suffix_merge']}")
         }
     
-    # 必須完整保留 _load_whisper_model
     def _load_whisper_model(self):
         if self.whisper_model is None:
             logger.info(f"正在加載 Whisper 模型 ({config.WHISPER_MODEL_SIZE})...")
@@ -197,21 +178,23 @@ class AutoSubGen:
                 logger.info(f"檢測到本地模型文件: {config.WHISPER_MODEL_SIZE}")
             self.whisper_model = whisper.load_model(config.WHISPER_MODEL_SIZE, device=self.device)
 
-    # 轉錄方法 (保留 verbose=True)
+    # --- 功能一：轉錄與潤飾 (修正監控邏輯) ---
     def transcribe_and_refine(self, video_path: str, output_path: str):
         if not os.path.exists(video_path): raise FileNotFoundError(f"找不到: {video_path}")
+        
         self._load_whisper_model()
         logger.info(f"開始轉錄: {video_path}")
 
-        # --- 1. 啟動監控執行緒 ---
+        # 1. 啟動監控
         self._stop_monitoring = False
         monitor_thread = threading.Thread(target=self._monitor_resources)
         monitor_thread.daemon = True 
         monitor_thread.start()
         
-        # --- 2. 使用 try...finally 確保監控會停止 ---
+        result = None
+
+        # 2. 執行轉錄 (含錯誤防護)
         try:
-            # 執行耗時的 Whisper 轉錄
             result = self.whisper_model.transcribe(
                 video_path, 
                 language="en", 
@@ -219,48 +202,200 @@ class AutoSubGen:
                 verbose=True
             )
         finally:
-            # --- 3. 無論成功或失敗，這裏都會執行，停止監控 ---
+            # 3. 停止監控
             self._stop_monitoring = True
-            monitor_thread.join() # 等待執行緒乾淨地結束
-            print("\n") # 印個換行，讓版面好看點
+            monitor_thread.join()
+            print("\n") 
 
-        #result = self.whisper_model.transcribe(video_path, language="en", fp16=(self.device=="cuda"), verbose=True)
-        
-        segments = result['segments']
-        logger.info(f"\n✅ 轉錄完成，共 {len(segments)} 行。")
-        
-        subs = pysubs2.SSAFile()
-        raw_texts = []
-        for seg in segments:
-            evt = pysubs2.SSAEvent(start=int(seg['start']*1000), end=int(seg['end']*1000), text=seg['text'].strip())
-            subs.events.append(evt)
-            raw_texts.append(evt.text)
+        # 4. 後續處理
+        if result:
+            segments = result['segments']
+            logger.info(f"✅ 轉錄完成，共 {len(segments)} 行。")
             
-        logger.info("正在進行潤飾...")
-        refined = self._process_text_unified(raw_texts, "refine") # 改名調用統一方法
-        
-        for i, txt in enumerate(refined[:len(subs.events)]): subs.events[i].text = txt
-        subs.save(output_path)
-        logger.info(f"已保存: {output_path}")
+            subs = pysubs2.SSAFile()
+            raw_texts = []
+            for seg in segments:
+                evt = pysubs2.SSAEvent(start=int(seg['start']*1000), end=int(seg['end']*1000), text=seg['text'].strip())
+                subs.events.append(evt)
+                raw_texts.append(evt.text)
+            
+            logger.info("正在進行潤飾...")
+            # 潤飾不需要全局分析，直接調用
+            refined = self._process_text_unified(raw_texts, "refine") 
+            
+            min_len = min(len(refined), len(subs.events))
+            for i in range(min_len):
+                subs.events[i].text = refined[i]
+                
+            subs.save(output_path)
+            logger.info(f"已保存: {output_path}")
 
-    # 翻譯方法
+    # --- 功能二：翻譯 (兩階段流程：分析 -> 翻譯) ---
     def translate_subtitles(self, input_path: str, output_path: str):
         if not os.path.exists(input_path): raise FileNotFoundError(f"找不到: {input_path}")
-        subs = pysubs2.load(input_path)
-        logger.info("正在進行翻譯...")
-        translated = self._process_text_unified([e.text for e in subs.events], "translate")
         
-        for i, txt in enumerate(translated[:len(subs.events)]): subs.events[i].text = txt
+        subs = pysubs2.load(input_path)
+        original_texts = [event.text for event in subs.events]
+        
+        # --- Step 1: 執行全局分析 (Pass 1) ---
+        global_context_str = self._analyze_global_context(original_texts)
+        
+        # --- Step 2: 執行翻譯 (Pass 2) ---
+        logger.info("正在進行第二階段：逐段翻譯 (Pass 2)...")
+        translated_texts = self._process_text_unified(
+            original_texts, 
+            mode="translate",
+            global_context=global_context_str # 傳入聖經
+        )
+        
+        min_len = min(len(translated_texts), len(subs.events))
+        for i in range(min_len):
+            subs.events[i].text = translated_texts[i]
+            
         subs.save(output_path)
         logger.info(f"已保存: {output_path}")
 
-    # 合併方法 (保持不變)
-    # 在 autosubgen.py 中替換/新增以下方法
+    # --- Pass 1: 全局分析核心 ---
+    def _analyze_global_context(self, all_texts: List[str]) -> str:
+        """閱讀完整劇本，生成劇情大綱與角色關係表 (翻譯聖經)"""
+        logger.info("正在進行第一階段：全局劇情與角色分析 (生成翻譯聖經)...")
+        
+        # 限制長度防呆
+        full_script = "\n".join(all_texts)[:100000]
+        
+        analysis_prompt = (
+            "You are a lead localization expert. Read the provided movie script/subtitles below.\n"
+            "Create a concise 'Translation Bible' to guide the translators.\n"
+            "Output strictly a JSON object (no markdown) with the following keys:\n"
+            "1. 'summary': A 3-sentence plot summary.\n"
+            "2. 'tone': The overall tone (e.g., Serious, Comedic, Formal, Slang-heavy).\n"
+            "3. 'characters': A list of main characters with their GENDER (Male/Female) and RELATIONSHIPS (e.g., 'A is B's boss', 'C and D are lovers'). This is crucial for Chinese pronouns (他/她) and honorifics (你/您).\n"
+            "4. 'key_terms': Key proper nouns or jargon that need consistent translation.\n"
+        )
 
+        try:
+            response = self.llm.process_batch(analysis_prompt, f"Script Content:\n{full_script}")
+            cleaned_response = response.replace("```json", "").replace("```", "").strip()
+            logger.info("✅ 翻譯聖經生成完成。")
+            return cleaned_response
+        except Exception as e:
+            logger.warning(f"⚠️ 全局分析失敗: {e}。將使用通用規則進行翻譯。")
+            return ""
+
+    # 修改 autosubgen.py 中的這個方法
+    def _get_enhanced_system_prompt(self, mode: str, global_context: str = "") -> str:
+        if mode == "refine":
+            return (
+                "You are a professional subtitle editor. "
+                "Correct grammar, casing, and punctuation errors. "
+                "Keep the subtitles concise. Do NOT change the meaning. "
+                "Output strictly a JSON list of strings."
+            )
+        
+        # Translate 模式 (加入第 7 點規則：反直譯與邏輯檢查)
+        base_prompt = (
+            "你是 Netflix 等級的資深字幕翻譯員，專精於將英文翻譯成「正體中文（台灣）」。\n"
+            "你的任務是根據「劇情背景」與「上下文」，將輸入的字幕翻譯成流暢、自然的台灣口語。\n\n"
+            "### 核心翻譯規則 (必須遵守) ###\n"
+            "1. **在地化用語**：絕對避免中國大陸用語，必須使用台灣習慣用語。\n"
+            "   - (例：視頻->影片, 質量->品質, 項目->專案, 軟件->軟體, 信息->資訊, 默認->預設, 網絡->網路)\n"
+            "2. **語氣與敬語**：這由角色關係決定。對上級或陌生人使用「您」，對平輩或下屬使用「你」。\n"
+            "3. **簡潔精準**：字幕不僅要準確，還要簡短有力，適合閱讀。\n"
+            "4. **專有名詞**：若背景設定中有指定譯名，請嚴格遵守。\n"
+            "5. **格式要求**：絕對不要輸出任何解釋或Markdown標記，**只輸出純 JSON 字串列表**。\n"
+            "6. **標點與排版**：中文字幕內容**不可包含任何標點符號**（如：，。？！）。若句子中間需要停頓或斷句，請強制使用「空格」代替；句尾也不要加符號。\n"
+            "7. **拒絕直譯 (關鍵)**：翻譯必須基於整句邏輯與語境。遇到英文慣用語 (Idioms)、倒裝句或強調句（如 'for the life of me', 'over my dead body'），**必須意譯其「言外之意」**，嚴禁逐字翻譯造成邏輯錯誤。\n"
+        )
+
+        if global_context:
+            base_prompt += (
+                "\n### 劇情背景與角色關係 (Translation Bible) ###\n"
+                "請參考以下設定來決定對話的語氣（敬語/粗俗/正式）：\n"
+                "------------------------------------------------\n"
+                f"{global_context}\n"
+                "------------------------------------------------\n"
+            )
+        
+        base_prompt += (
+            "\n### 動態輸入說明 ###\n"
+            "你將收到一個 JSON 物件，包含：\n"
+            "- 'previous_context': 上一段對話內容（僅供參考，用於連貫語氣）。\n"
+            "- 'lines_to_process': 需要翻譯的英文句子列表。\n\n"
+            "請參考 'previous_context' 的語境，僅翻譯 'lines_to_process' 部分。"
+        )
+        return base_prompt
+    
+    # --- Pass 2: 統一處理核心 (滑動窗口 + 注入 Prompt) ---
+    def _process_text_unified(self, texts: List[str], mode: str, global_context: str = "") -> List[str]:
+        processed_texts = []
+        batch_size = 20
+        max_retries = 3
+        
+        sys_prompt = self._get_enhanced_system_prompt(mode, global_context)
+        previous_context = [] # 滑動窗口
+
+        for i in tqdm(range(0, len(texts), batch_size), desc=f"AI Processing ({mode})"):
+            batch = texts[i : i + batch_size]
+            
+            # 建構輸入資料：包含上下文 + 本次要翻譯的句子
+            context_str = "\n".join(previous_context) if previous_context else "無 (對話開始)"
+            user_content_obj = {
+                "previous_context": context_str,
+                "lines_to_process": batch
+            }
+            
+            # Refine 模式使用簡單 JSON，Translate 模式使用帶上下文的 JSON
+            if mode == "refine":
+                user_content_str = json.dumps(batch, ensure_ascii=False)
+            else:
+                user_content_str = json.dumps(user_content_obj, ensure_ascii=False)
+
+            for attempt in range(max_retries):
+                try:
+                    response_text = self.llm.process_batch(sys_prompt, f"Input Data:\n{user_content_str}")
+                    
+                    try:
+                        clean_text = response_text.replace("```json", "").replace("```", "").strip()
+                        data = json.loads(clean_text)
+                        
+                        if isinstance(data, dict):
+                            # 嘗試找 list 類型的 value
+                            values = [v for v in data.values() if isinstance(v, list)]
+                            batch_result = values[0] if values else batch
+                        elif isinstance(data, list):
+                            batch_result = data
+                        else:
+                            batch_result = batch
+                    except json.JSONDecodeError:
+                        logger.warning(f"Batch {i} JSON 解析失敗，使用原文。")
+                        batch_result = batch
+
+                    if len(batch_result) != len(batch):
+                        if len(batch_result) > len(batch):
+                            batch_result = batch_result[:len(batch)]
+                        else:
+                            batch_result.extend(batch[len(batch_result):])
+
+                    processed_texts.extend(batch_result)
+                    
+                    # 更新上下文：取最後 3 句翻譯結果
+                    previous_context = batch_result[-3:]
+                    break 
+
+                except Exception as e:
+                    logger.warning(f"API Error (Attempt {attempt+1}): {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                    else:
+                        logger.error(f"Batch {i} 失敗，使用原文。")
+                        processed_texts.extend(batch)
+                        previous_context = batch[-3:]
+        
+        return processed_texts
+
+    # --- 字幕合併 (復刻樣式) ---
     def merge_subtitles(self, zh_path: str, en_path: str, output_path: str):
-        
         logger.info("開始合併雙語字幕 (樣式復刻模式)...")
-        
         try:
             subs_zh = pysubs2.load(zh_path)
             subs_en = pysubs2.load(en_path)
@@ -268,38 +403,26 @@ class AutoSubGen:
             logger.error(f"讀取字幕文件失敗: {e}")
             return
 
-        # 1. 建立新的字幕檔，並設定 Header 參數 (PlayRes)
         merged_subs = pysubs2.SSAFile()
-        merged_subs.info.update(config.ASS_PARAMS) # 寫入 384x288 解析度設定
+        merged_subs.info.update(config.ASS_PARAMS)
 
-        # 2. 載入並註冊樣式
         style_main_cfg = config.STYLE_CONFIG["main"]
         style_sec_cfg = config.STYLE_CONFIG["second"]
 
         merged_subs.styles[style_main_cfg["Name"]] = self._create_pysubs2_style(style_main_cfg)
         merged_subs.styles[style_sec_cfg["Name"]] = self._create_pysubs2_style(style_sec_cfg)
 
-        # 3. 合併邏輯
-        # 由於 Whisper 生成的時間軸非常精準，中英行數通常一致。
-        # 為了保險，我們使用時間戳記來尋找對應的英文字幕，而不是假設行號對應。
-        
-        # 建立英文事件的索引加速查找
-        # 簡單策略：假設行數大致對應，若不對應則尋找時間重疊最大的
-        
         logger.info(f"正在合併 {len(subs_zh)} 行字幕...")
         
-        # 為了處理兩者行數不一致的情況，我們遍歷中文，去英文裏找對應
         for z_event in subs_zh.events:
             z_start = z_event.start
             z_end = z_event.end
             z_text = z_event.text.strip()
             
-            # 尋找時間重疊最多的英文句子
             best_match_en = ""
             max_overlap = 0
             
             for e_event in subs_en.events:
-                # 計算重疊時間
                 overlap_start = max(z_start, e_event.start)
                 overlap_end = min(z_end, e_event.end)
                 overlap = overlap_end - overlap_start
@@ -307,20 +430,14 @@ class AutoSubGen:
                 if overlap > max_overlap:
                     max_overlap = overlap
                     best_match_en = e_event.text.strip()
-                
-                # 優化：如果你已經過了這段時間，就不用再往下找了 (假設是有序的)
                 if e_event.start > z_end:
                     break
             
-            # 4. 構建雙語內容
-            # 格式：中文\N{\rEng}English
-            # \N 是換行，{\rEng} 是強制重置該行剩餘部分的樣式為 "Eng"
             if best_match_en:
                 final_text = f"{z_text}\\N{{\\r{style_sec_cfg['Name']}}}{best_match_en}"
             else:
-                final_text = z_text # 沒找到英文就只放中文
+                final_text = z_text
 
-            # 建立新事件，使用主樣式 (Default)
             new_event = pysubs2.SSAEvent(
                 start=z_start,
                 end=z_end,
@@ -333,9 +450,6 @@ class AutoSubGen:
         logger.info(f"✅ 雙語字幕合併完成，已保存為: {output_path}")
 
     def _create_pysubs2_style(self, cfg: dict) -> pysubs2.SSAStyle:
-        """
-        將 config 字典轉換為 pysubs2.SSAStyle 物件
-        """
         style = pysubs2.SSAStyle()
         style.fontname = cfg.get("Fontname", "Arial")
         style.fontsize = cfg.get("Fontsize", 20)
@@ -359,63 +473,3 @@ class AutoSubGen:
         hex_str = ass_hex.replace("&H", "")
         if len(hex_str) != 8: return 255, 255, 255, 0
         return int(hex_str[6:8], 16), int(hex_str[4:6], 16), int(hex_str[2:4], 16), int(hex_str[0:2], 16)
-
-    # ==========================================
-    # 3. 統一的處理核心 (Unified Processor)
-    # ==========================================
-    
-    def _process_text_unified(self, texts: List[str], mode: str) -> List[str]:
-        """
-        統一處理邏輯：負責 Batch 切分、重試循環、調用後端
-        """
-        processed_texts = []
-        batch_size = 20
-        max_retries = 3
-        
-        if mode == "refine":
-            sys_prompt = "Correct grammar/punctuation. Return a JSON list of strings."
-        else:
-            sys_prompt = "Translate to Traditional Chinese (Taiwan). Return a JSON list of strings."
-
-        for i in tqdm(range(0, len(texts), batch_size), desc=f"AI Processing ({mode})"):
-            batch = texts[i : i + batch_size]
-            user_content = json.dumps(batch, ensure_ascii=False)
-            
-            # 重試機制
-            for attempt in range(max_retries):
-                try:
-                    # 調用多態的 llm.process_batch
-                    response_text = self.llm.process_batch(sys_prompt, f"Process: {user_content}")
-                    
-                    # 嘗試解析 JSON
-                    try:
-                        # 清理可能存在的 Markdown code block (例如 ```json ... ```)
-                        clean_text = response_text.replace("```json", "").replace("```", "").strip()
-                        data = json.loads(clean_text)
-                        
-                        if isinstance(data, dict):
-                            batch_result = list(data.values())[0] if data.values() else batch
-                        elif isinstance(data, list):
-                            batch_result = data
-                        else:
-                            batch_result = batch
-                    except json.JSONDecodeError:
-                        logger.warning(f"Batch {i} JSON 解析失敗，嘗試修復或放棄...")
-                        batch_result = batch
-
-                    if len(batch_result) != len(batch):
-                        batch_result = batch
-                        
-                    processed_texts.extend(batch_result)
-                    break # 成功則跳出重試
-
-                except Exception as e:
-                    # 統一捕捉各家 API 的錯誤
-                    logger.warning(f"API Error (Attempt {attempt+1}): {e}")
-                    if attempt < max_retries - 1:
-                        time.sleep(2 ** attempt)
-                    else:
-                        logger.error(f"Batch {i} 最終失敗，使用原文。")
-                        processed_texts.extend(batch)
-        
-        return processed_texts
