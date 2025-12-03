@@ -5,7 +5,7 @@ import os
 
 # --- API Keys ---
 OPENAI_API_KEY = "" # 填入您的 Key
-GEMINI_API_KEY = "AIzaSyBdMPa12GTLZOWQvLCBKu8IezIzkHwhuJk"
+GEMINI_API_KEY = ""
 CLAUDE_API_KEY = ""
 
 # --- 模型名稱設定 ---
